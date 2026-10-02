@@ -231,3 +231,28 @@ curl -sS -X POST "$BASE/cargo/$CA/responsibilities/veh:vr-1/stances" \
     \"stance_id\": \"stance-ca-bj-1\"
   }"; echo
 curl -sS "$BASE/cargo/$CA/responsibilities/veh:vr-1/stances"; echo
+
+echo
+echo "================ 本轮新增：车次同时越温时段查询（质控） ================"
+
+echo "29) 追加车载读数：15:00 9℃（对上限 4℃ 的 $CA 与上限 8℃ 的 $CB 均越温），16:00 3℃（双双闭合）"
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-4\", \"trip_id\": \"$TRIP\",
+  \"read_at\": \"2026-09-30T15:00:00+08:00\", \"temperature\": \"9.0\"
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-5\", \"trip_id\": \"$TRIP\",
+  \"read_at\": \"2026-09-30T16:00:00+08:00\", \"temperature\": \"3.0\"
+}" >/dev/null
+echo "（已写入 vr-4 / vr-5）"
+
+echo "30) 同时越温查询：查询窗 08:00~20:00(+08:00)、数量门槛 2 -> 仅 15:00~16:00 两票同时越温"
+curl -sS "$BASE/trips/$TRIP/co-excursions?start=2026-09-30T08:00:00%2B08:00&end=2026-09-30T20:00:00%2B08:00&min_cargo_count=2" | python3 -m json.tool; echo
+
+echo "31) 数量门槛 3：车上最多 2 票同时越温 -> 空结果"
+curl -sS "$BASE/trips/$TRIP/co-excursions?start=2026-09-30T08:00:00%2B08:00&end=2026-09-30T20:00:00%2B08:00&min_cargo_count=3"; echo
+
+echo "32) 非法参数：门槛 1 -> 422 invalid_min_cargo_count；终点不晚于起点 -> 422 invalid_query_window；未知车次 -> 404 trip_not_found"
+curl -sS "$BASE/trips/$TRIP/co-excursions?start=2026-09-30T08:00:00%2B08:00&end=2026-09-30T20:00:00%2B08:00&min_cargo_count=1"; echo
+curl -sS "$BASE/trips/$TRIP/co-excursions?start=2026-09-30T20:00:00%2B08:00&end=2026-09-30T08:00:00%2B08:00"; echo
+curl -sS "$BASE/trips/NOPE/co-excursions?start=2026-09-30T08:00:00%2B08:00&end=2026-09-30T20:00:00%2B08:00"; echo

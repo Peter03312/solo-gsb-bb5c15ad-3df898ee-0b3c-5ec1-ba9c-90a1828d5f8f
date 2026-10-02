@@ -408,6 +408,31 @@ class TripDetail(TripOut):
     readings: list[TripReadingOut]
 
 
+class CoExcursionSegment(BaseModel):
+    """一段同时越温时段：半开区间 [start, end) 及当段越温货物。"""
+
+    start: datetime = Field(..., description="时段起点（含）")
+    end: datetime = Field(..., description="时段终点（不含）")
+    cargo_ids: list[str] = Field(
+        ..., description="该时段内处于越温状态的货物编号（升序）"
+    )
+    cargo_count: int = Field(..., description="当段越温货物票数")
+
+
+class CoExcursionReport(BaseModel):
+    """车次同时越温查询结果：按时间升序、互不重叠的达标时段。"""
+
+    trip_id: str
+    query_start: datetime = Field(..., description="查询窗起点（含，UTC）")
+    query_end: datetime = Field(..., description="查询窗终点（不含，UTC）")
+    min_cargo_count: int = Field(..., description="本次查询的数量门槛（>=2）")
+    segments: list[CoExcursionSegment] = Field(
+        ...,
+        description="同时越温票数达到门槛的时段（货物集合变化即分段，"
+        "相邻同集合片段已合并）；无匹配时为空",
+    )
+
+
 class TimelinePointOut(BaseModel):
     """货物合并读数时间线上的一个点（查询各货物采用的读数来源）。"""
 

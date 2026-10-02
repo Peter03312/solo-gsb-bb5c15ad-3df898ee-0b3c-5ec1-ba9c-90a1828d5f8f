@@ -19,12 +19,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from app import chain, coexcursion, timeline
 from app.crud import ApiError
-from app.models import Loading, Trip, VehicleReading
+from app.models import Cargo, Loading, Trip, VehicleReading
 from app.schemas import ManifestCreate, TripCreate, VehicleReadingCreate
 from app.timeutil import ensure_utc
 
@@ -81,8 +83,6 @@ def _load_trip_locked(db, trip_id: str) -> Trip:
 
 def _lock_cargo_rows(db, cargo_ids):
     """按 cargo_id 升序锁定货物行；任一不存在返回 404。"""
-    from app.models import Cargo
-
     rows = {}
     missing = []
     for cargo_id in sorted(set(cargo_ids)):
@@ -366,3 +366,92 @@ def get_readings(db, trip_id: str) -> list[VehicleReading]:
             .order_by(VehicleReading.read_at, VehicleReading.reading_id)
         ).all()
     )
+
+
+# ----------------------------------------------------------- 同时越温查询
+
+
+def _begin_snapshot_read(db) -> None:
+    """让本次查询的全部 SELECT 基于同一份已提交数据视图。
+
+    PostgreSQL 默认 READ COMMITTED 下每条语句各自取快照，并发的事件 / 车载读数
+    写入可能使同次查询内读到的装卸、事件、读数不属于同一时刻；在事务首个语句
+    位置提升为 REPEATABLE READ 后，整个查询看到事务开始时已提交的一致快照。
+    SQLite 单连接事务内的读天然一致，无需处理。
+    """
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+
+
+def find_co_excursions(
+    db,
+    trip_id: str,
+    query_start,
+    query_end,
+    min_cargo_count: int,
+) -> list[coexcursion.CoSegment]:
+    """查找车次上同时越温（>= min_cargo_count 票）的时段。
+
+    对车次上每票货物：在合并读数时间线上重建越温区间（同刻自有测温优先），
+    与其在本车次的装卸时段（左闭右开）及查询窗相交，未闭合区间裁剪至查询
+    终点；再做扫描线合并，仅保留达到门槛的正长度片段。
+    """
+    if min_cargo_count < 2:
+        raise _unprocessable(
+            f"数量门槛 min_cargo_count={min_cargo_count} 非法："
+            "同时越温查询的门槛不得小于 2 票",
+            code="invalid_min_cargo_count",
+        )
+    query_start = ensure_utc(query_start)
+    query_end = ensure_utc(query_end)
+    if query_end <= query_start:
+        raise _unprocessable(
+            f"查询窗无效：终点 {query_end.isoformat()} 不晚于起点 "
+            f"{query_start.isoformat()}",
+            code="invalid_query_window",
+        )
+
+    # 在任何 SELECT 之前提升隔离级别：同次查询基于一致的已提交数据视图
+    _begin_snapshot_read(db)
+
+    if db.get(Trip, trip_id) is None:
+        raise _not_found(f"车次 {trip_id} 不存在")
+
+    loadings = get_loadings(db, trip_id)
+    for l in loadings:
+        l.loaded_at = ensure_utc(l.loaded_at)
+        l.unloaded_at = ensure_utc(l.unloaded_at)
+    trip_loadings: dict[str, list[Loading]] = {}
+    for l in loadings:
+        trip_loadings.setdefault(l.cargo_id, []).append(l)
+
+    cargos = {
+        c.cargo_id: c
+        for c in db.scalars(
+            select(Cargo).where(
+                Cargo.cargo_id.in_(sorted(trip_loadings) or [""])
+            )
+        ).all()
+    }
+
+    per_cargo: dict[str, list] = {}
+    for cargo_id in sorted(trip_loadings):
+        cargo = cargos[cargo_id]
+        cargo.started_at = ensure_utc(cargo.started_at)
+        events, all_loadings, readings = timeline.load_cargo_context(
+            db, cargo_id
+        )
+        points = timeline.adopted_timeline(events, readings, all_loadings)
+        result = chain.rebuild_chain(
+            cargo.initial_holder, Decimal(cargo.temp_upper_limit), points
+        )
+        pieces = coexcursion.clip_cargo_excursions(
+            result.excursions,
+            trip_loadings[cargo_id],
+            query_start,
+            query_end,
+        )
+        if pieces:
+            per_cargo[cargo_id] = pieces
+
+    return coexcursion.simultaneous_segments(per_cargo, min_cargo_count)

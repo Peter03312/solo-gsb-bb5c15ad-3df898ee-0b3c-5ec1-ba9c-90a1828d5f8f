@@ -192,8 +192,9 @@ def main() -> None:
 
         # ==================== 车次 / 装卸时段 / 车载测温 ====================
         trip = "TRUCK-PY-1"
-        cargo_a = "COLD-CAR-A"
-        cargo_b = "COLD-CAR-B"
+        # 货物编号与 curl 示例错开，两个示例可先后对同一服务运行
+        cargo_a = "COLD-PY-A"
+        cargo_b = "COLD-PY-B"
         for cid, limit in ((cargo_a, "4.0"), (cargo_b, "8.0")):
             api.post(
                 "/cargo",
@@ -323,6 +324,60 @@ def main() -> None:
             )
             show("车载区间表态历史",
                  api.get(f"/cargo/{cargo_a}/responsibilities/{viid}/stances"))
+
+        # ==================== 质控：车次同时越温时段查询 ====================
+        # 15:00 车载 9℃：对上限 4℃ 的 A 与上限 8℃ 的 B 均越温；16:00 3℃ 双双闭合
+        for rid, at, temp in (("py-vr4", "2026-09-30T15:00:00+08:00", "9.0"),
+                              ("py-vr5", "2026-09-30T16:00:00+08:00", "3.0")):
+            api.post(
+                "/vehicle-readings",
+                json={"reading_id": rid, "trip_id": trip,
+                      "read_at": at, "temperature": temp},
+            )
+
+        show(
+            "同时越温查询（门槛 2：仅 15:00~16:00 两票同时越温）",
+            api.get(
+                f"/trips/{trip}/co-excursions",
+                params={
+                    "start": "2026-09-30T08:00:00+08:00",
+                    "end": "2026-09-30T20:00:00+08:00",
+                    "min_cargo_count": 2,
+                },
+            ),
+        )
+        show(
+            "数量门槛 3（车上最多 2 票同时越温 -> 空结果）",
+            api.get(
+                f"/trips/{trip}/co-excursions",
+                params={
+                    "start": "2026-09-30T08:00:00+08:00",
+                    "end": "2026-09-30T20:00:00+08:00",
+                    "min_cargo_count": 3,
+                },
+            ),
+        )
+        show(
+            "非法门槛（<2 -> 422 invalid_min_cargo_count）",
+            api.get(
+                f"/trips/{trip}/co-excursions",
+                params={
+                    "start": "2026-09-30T08:00:00+08:00",
+                    "end": "2026-09-30T20:00:00+08:00",
+                    "min_cargo_count": 1,
+                },
+            ),
+        )
+        show(
+            "终点不晚于起点（-> 422 invalid_query_window）",
+            api.get(
+                f"/trips/{trip}/co-excursions",
+                params={
+                    "start": "2026-09-30T20:00:00+08:00",
+                    "end": "2026-09-30T08:00:00+08:00",
+                },
+            ),
+        )
 
 
 if __name__ == "__main__":

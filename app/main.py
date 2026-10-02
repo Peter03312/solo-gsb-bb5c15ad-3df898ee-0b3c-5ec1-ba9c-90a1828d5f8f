@@ -4,9 +4,10 @@
 一键启动    : docker compose up --build  （见 README）
 """
 from contextlib import asynccontextmanager
+from datetime import datetime
 from decimal import Decimal
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -34,6 +35,8 @@ from app.schemas import (
     CargoOut,
     CargoTimeline,
     ChainReport,
+    CoExcursionReport,
+    CoExcursionSegment,
     EventCreate,
     EventOut,
     Excursion,
@@ -76,9 +79,10 @@ app = FastAPI(
     title="冷链货物追责服务",
     description=(
         "记录冷链货物的自有测温与交接事件、车次装卸时段与车载测温读数，"
-        "在合并读数时间线上按发生时间重建保管链，计算越温区间并拆分各保管方责任。"
+        "在合并读数时间线上按发生时间重建保管链，计算越温区间并拆分各保管方责任；"
+        "并提供同一车次多票货物同时越温时段的质控查询。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -372,6 +376,55 @@ def get_trip_detail(trip_id: str, db: Session = Depends(get_db)) -> TripDetail:
             for l in loadings
         ],
         readings=trip_readings,
+    )
+
+
+@app.get(
+    "/trips/{trip_id}/co-excursions",
+    response_model=CoExcursionReport,
+    tags=["质控查询"],
+    responses={
+        404: {"description": "车次不存在"},
+        422: {"description": "查询窗或数量门槛非法"},
+    },
+)
+def trip_co_excursions(
+    trip_id: str,
+    start: datetime = Query(
+        ..., description="查询起点（含），ISO 8601，建议带时区；无时区按 UTC"
+    ),
+    end: datetime = Query(
+        ..., description="查询终点（不含），必须晚于起点"
+    ),
+    min_cargo_count: int = Query(
+        2, description="同时越温票数门槛（不小于 2）"
+    ),
+    db: Session = Depends(get_db),
+) -> CoExcursionReport:
+    """同一车次多票货物的**同时越温时段**查询。
+
+    对车次上每票货物按合并读数时间线重建越温区间（同刻自有测温优先），
+    与其在本车次的装卸时段（左闭右开）及查询窗相交，未闭合区间裁剪至查询
+    终点；货物集合变化即分段、相邻同集合片段合并，仅保留达到门槛的正长度
+    片段。整个查询基于同一份已提交数据视图，晚到读数 / 事件写入后即反映。
+    """
+    segments = vehicle_crud.find_co_excursions(
+        db, trip_id, ensure_utc(start), ensure_utc(end), min_cargo_count
+    )
+    return CoExcursionReport(
+        trip_id=trip_id,
+        query_start=ensure_utc(start),
+        query_end=ensure_utc(end),
+        min_cargo_count=min_cargo_count,
+        segments=[
+            CoExcursionSegment(
+                start=seg.start,
+                end=seg.end,
+                cargo_ids=list(seg.cargo_ids),
+                cargo_count=len(seg.cargo_ids),
+            )
+            for seg in segments
+        ],
     )
 
 
