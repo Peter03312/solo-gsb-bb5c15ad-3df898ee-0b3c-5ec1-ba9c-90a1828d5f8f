@@ -4,6 +4,7 @@
 一键启动    : docker compose up --build  （见 README）
 """
 from contextlib import asynccontextmanager
+from datetime import datetime
 from decimal import Decimal
 
 from fastapi import Depends, FastAPI, Request
@@ -61,6 +62,8 @@ from app.schemas import (
     VehicleReadingCreate,
     VehicleReadingOut,
     VehicleReadingReplay,
+    SimultaneousExcursionReport,
+    SimultaneousExcursionSegment,
 )
 from app.timeutil import ensure_utc
 
@@ -78,7 +81,7 @@ app = FastAPI(
         "记录冷链货物的自有测温与交接事件、车次装卸时段与车载测温读数，"
         "在合并读数时间线上按发生时间重建保管链，计算越温区间并拆分各保管方责任。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -372,6 +375,110 @@ def get_trip_detail(trip_id: str, db: Session = Depends(get_db)) -> TripDetail:
             for l in loadings
         ],
         readings=trip_readings,
+    )
+
+
+# ---------------------------------------------------------------- 质控：同时越温查询
+
+
+def _parse_aware_datetime(raw: str, field: str) -> datetime:
+    """解析查询参数中的 ISO 8601 时刻；必须带时区（调用方明确给出带时区起止）。"""
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        raise crud.ApiError(
+            422,
+            "invalid_query_window",
+            f"参数 {field}={raw!r} 不是合法的 ISO 8601 日期时间",
+        )
+    if parsed.tzinfo is None:
+        raise crud.ApiError(
+            422,
+            "timezone_required",
+            f"参数 {field}={raw!r} 必须携带时区偏移（如 2026-09-30T08:00:00+08:00）",
+        )
+    return ensure_utc(parsed)
+
+
+def _parse_min_cargo(raw: str | None) -> int:
+    """数量门槛：不小于 2 的正整数（缺省 2）。"""
+    if raw is None:
+        return 2
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise crud.ApiError(
+            422,
+            "invalid_min_cargo",
+            f"参数 min_cargo={raw!r} 非法：必须为不小于 2 的整数",
+        )
+    if value < 2:
+        raise crud.ApiError(
+            422,
+            "invalid_min_cargo",
+            f"参数 min_cargo={value} 非法：必须为不小于 2 的整数",
+        )
+    return value
+
+
+@app.get(
+    "/trips/{trip_id}/simultaneous-excursions",
+    response_model=SimultaneousExcursionReport,
+    tags=["质控查询"],
+    responses={
+        404: {"description": "车次不存在"},
+        422: {"description": "查询窗非法（终点不晚于起点 / 缺时区）或门槛非法"},
+    },
+)
+def trip_simultaneous_excursions(
+    trip_id: str,
+    start_at: str | None = None,
+    end_at: str | None = None,
+    min_cargo: str | None = None,
+    db: Session = Depends(get_db),
+) -> SimultaneousExcursionReport:
+    """质控：查找同一车次上**多票货物同时越温**的时段。
+
+    每票货物按其现有合并读数时间线重建越温区间（同刻自有测温优先、车载读数
+    仅对在车货物按各自上限生效），与该车次装卸时段（左闭右开）及查询窗
+    相交（未闭合区间裁剪至查询终点）后扫描线叠加：货物集合变化即分段、
+    相邻同集合片段合并，仅保留越温货物数达到 ``min_cargo``（默认 2）的
+    正长度片段，按时间升序返回。晚到读数 / 事件提交后的查询反映新结果，
+    同一次查询基于一致的已提交数据视图（PostgreSQL 下 REPEATABLE READ 快照）。
+    """
+    if start_at is None:
+        raise crud.ApiError(
+            422,
+            "missing_parameter",
+            "缺少必填参数 start_at：带时区的查询起点（ISO 8601）",
+        )
+    if end_at is None:
+        raise crud.ApiError(
+            422,
+            "missing_parameter",
+            "缺少必填参数 end_at：带时区的查询终点（ISO 8601，严格晚于起点）",
+        )
+    start = _parse_aware_datetime(start_at, "start_at")
+    end = _parse_aware_datetime(end_at, "end_at")
+    threshold = _parse_min_cargo(min_cargo)
+
+    segments = vehicle_crud.query_simultaneous_excursions(
+        db, trip_id, start, end, threshold
+    )
+    return SimultaneousExcursionReport(
+        trip_id=trip_id,
+        start_at=start,
+        end_at=end,
+        min_cargo=threshold,
+        segments=[
+            SimultaneousExcursionSegment(
+                start=seg.start,
+                end=seg.end,
+                cargo_count=seg.cargo_count,
+                cargo_ids=list(seg.cargo_ids),
+            )
+            for seg in segments
+        ],
     )
 
 

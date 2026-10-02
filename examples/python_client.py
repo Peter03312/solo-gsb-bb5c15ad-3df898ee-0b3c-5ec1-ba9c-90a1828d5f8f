@@ -324,6 +324,77 @@ def main() -> None:
             show("车载区间表态历史",
                  api.get(f"/cargo/{cargo_a}/responsibilities/{viid}/stances"))
 
+        # ==================== 质控：同一车次同时越温查询 ====================
+        # 再挂一票上限 4℃ 的货物 Q：A、Q 上限 4℃，B 上限 8℃。
+        # 10:00 车载 7℃：A、Q 越温（B 不越）；11:00 A 有自有 3.1℃ 测温先闭合
+        # （同刻车载 7℃ 对 A 被取代），Q 仍越温；14:00 车载 3℃ 闭合 Q。
+        cargo_q = "COLD-CAR-Q"
+        show(
+            "创建质控演示货物 Q（上限 4℃）",
+            api.post(
+                "/cargo",
+                json={
+                    "cargo_id": cargo_q,
+                    "started_at": "2026-09-30T08:00:00+08:00",
+                    "temp_upper_limit": "4.0",
+                    "initial_holder": "北京冷库",
+                },
+            ),
+        )
+        show(
+            "Q 挂到同一车次",
+            api.post(
+                f"/trips/{trip}/manifest",
+                json={"items": [
+                    {"cargo_id": cargo_q,
+                     "loaded_at": "2026-09-30T09:00:00+08:00",
+                     "unloaded_at": "2026-09-30T18:00:00+08:00"},
+                ]},
+            ),
+        )
+
+        show(
+            "同时越温时段（默认门槛 2）",
+            api.get(
+                f"/trips/{trip}/simultaneous-excursions",
+                params={
+                    "start_at": "2026-09-30T00:00:00+08:00",
+                    "end_at": "2026-10-01T00:00:00+08:00",
+                },
+            ),
+        )
+        show(
+            "门槛 3（B 上限 8℃ 全程不越温 -> 空结果）",
+            api.get(
+                f"/trips/{trip}/simultaneous-excursions",
+                params={
+                    "start_at": "2026-09-30T00:00:00+08:00",
+                    "end_at": "2026-10-01T00:00:00+08:00",
+                    "min_cargo": 3,
+                },
+            ),
+        )
+        show(
+            "查询窗裁剪（09:30-10:30）",
+            api.get(
+                f"/trips/{trip}/simultaneous-excursions",
+                params={
+                    "start_at": "2026-09-30T09:30:00+08:00",
+                    "end_at": "2026-09-30T10:30:00+08:00",
+                },
+            ),
+        )
+        show(
+            "非法查询窗（终点不晚于起点，422）",
+            api.get(
+                f"/trips/{trip}/simultaneous-excursions",
+                params={
+                    "start_at": "2026-10-01T00:00:00+08:00",
+                    "end_at": "2026-09-30T00:00:00+08:00",
+                },
+            ),
+        )
+
 
 if __name__ == "__main__":
     main()

@@ -231,3 +231,55 @@ curl -sS -X POST "$BASE/cargo/$CA/responsibilities/veh:vr-1/stances" \
     \"stance_id\": \"stance-ca-bj-1\"
   }"; echo
 curl -sS "$BASE/cargo/$CA/responsibilities/veh:vr-1/stances"; echo
+
+echo
+echo "================ 本轮新增：质控同时越温查询 ================"
+# 再挂一票上限 4℃ 的货物 Q 到同一车次（CA 上限 4℃、CB 上限 8℃）
+CQ="COLD-CAR-Q"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$CQ\",
+  \"started_at\": \"2026-09-30T08:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\",
+  \"initial_holder\": \"北京冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips/$TRIP/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [
+    {\"cargo_id\": \"$CQ\",
+     \"loaded_at\": \"2026-09-30T09:00:00+08:00\",
+     \"unloaded_at\": \"2026-09-30T18:00:00+08:00\"}
+  ]
+}" >/dev/null
+
+# 回顾已有读数：10:00 车载 7℃（CA、Q 越温；CB 上限 8℃ 不越）；
+# 11:00 CA 有自有 3.1℃ 测温 -> CA 此时刻闭合（同刻车载 7℃ 对 CA 被取代），Q 仍越温；
+# 14:00 车载 3℃ -> Q 闭合。
+echo "29) 同时越温时段（min_cargo 默认 2）：仅 10:00-11:00 [CA,Q] 两票同时越温"
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00" | python3 -m json.tool; echo
+
+echo "30) 查询窗裁剪（09:30-10:30）：片段被裁到查询窗内"
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T09:30:00+08:00" \
+  --data-urlencode "end_at=2026-09-30T10:30:00+08:00" | python3 -m json.tool; echo
+
+echo "31) 门槛 3（min_cargo=3）：CB 上限 8℃ 全程不越温，无三票同时段 -> 空结果"
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00" \
+  --data-urlencode "min_cargo=3"; echo
+
+echo "32) 错误示例：未知车次 / 终点不晚于起点 / 门槛非法 / 缺时区"
+curl -sS -G "$BASE/trips/NO-TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00"; echo
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-10-01T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-09-30T00:00:00+08:00"; echo
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00" \
+  --data-urlencode "min_cargo=1"; echo
+curl -sS -G "$BASE/trips/$TRIP/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00"; echo

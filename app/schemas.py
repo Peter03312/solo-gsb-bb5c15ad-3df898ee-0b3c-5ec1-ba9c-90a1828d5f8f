@@ -437,3 +437,31 @@ class CargoTimeline(BaseModel):
     points: list[TimelinePointOut] = Field(
         ..., description="合并读数时间线（含被自有测温取代的车载原始读数），按时间"
     )
+
+
+# ----------------------------------------------------- 质控：同时越温查询
+
+
+class SimultaneousExcursionSegment(BaseModel):
+    """同时越温片段：窗口内越温货物集合恒定，且数量达到门槛。"""
+
+    start: datetime = Field(..., description="片段起点（含，UTC）")
+    end: datetime = Field(..., description="片段终点（不含，UTC；未闭合区间已裁至查询终点）")
+    cargo_count: int = Field(..., description="该片段同时越温的货物数量")
+    cargo_ids: list[str] = Field(
+        ..., description="该片段同时越温的货物编号（按编号排序）"
+    )
+
+
+class SimultaneousExcursionReport(BaseModel):
+    """同一车次同时越温时段查询结果（按时间排序的不重叠片段）。"""
+
+    trip_id: str
+    start_at: datetime = Field(..., description="查询窗起点（含）")
+    end_at: datetime = Field(..., description="查询窗终点（不含）")
+    min_cargo: int = Field(..., description="生效的数量门槛")
+    segments: list[SimultaneousExcursionSegment] = Field(
+        ...,
+        description="同时越温货物数达到门槛的正长度片段；集合变化即分段，"
+        "相邻同集合片段已合并；无匹配时为空列表",
+    )

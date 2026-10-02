@@ -19,12 +19,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from app import chain, overlap, timeline
 from app.crud import ApiError
-from app.models import Loading, Trip, VehicleReading
+from app.models import Cargo, Loading, Trip, VehicleReading
 from app.schemas import ManifestCreate, TripCreate, VehicleReadingCreate
 from app.timeutil import ensure_utc
 
@@ -366,3 +368,80 @@ def get_readings(db, trip_id: str) -> list[VehicleReading]:
             .order_by(VehicleReading.read_at, VehicleReading.reading_id)
         ).all()
     )
+
+
+# ----------------------------------------------------------- 质控：同时越温查询
+
+
+def query_simultaneous_excursions(db, trip_id: str, start_at, end_at, min_cargo: int):
+    """同一车次上多票货物同时越温时段查询。
+
+    只读查询，整次查询基于一个**一致的已提交数据视图**：PostgreSQL 下以
+    REPEATABLE READ 快照事务执行（SQLite 单连接读本身串行，无需提升级别）。
+    晚到读数 / 事件在本次查询事务开始前已提交即会被反映，提交后才能被
+    下一次查询看到；查询期间其他事务的中途写入不会被混入。
+
+    每票货物都按其**现有合并时间线**重建越温区间（同刻自有测温优先、
+    车载读数仅对在车货物生效），再与该车次装卸时段（左闭右开）及查询窗
+    相交；未闭合区间裁剪至查询终点。
+    """
+    if min_cargo < 2:
+        raise ApiError(
+            422,
+            "invalid_min_cargo",
+            f"数量门槛 min_cargo={min_cargo} 非法：必须为不小于 2 的整数",
+        )
+    if end_at <= start_at:
+        raise ApiError(
+            422,
+            "invalid_query_window",
+            f"查询窗非法：终点 {end_at.isoformat()} 必须严格晚于起点 "
+            f"{start_at.isoformat()}",
+        )
+
+    # 一致快照：在该 Session 的第一条 SQL 前指定事务隔离级别。
+    # PG REPEATABLE READ 的快照在首条查询时建立，之后整个事务看到同一已提交版本；
+    # SQLite 全库单连接（内存库 StaticPool），读期间视图天然一致。
+    bind = db.get_bind()
+    if bind.dialect.name == "postgresql":
+        db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+
+    if db.get(Trip, trip_id) is None:
+        raise ApiError(404, "trip_not_found", f"车次 {trip_id} 不存在")
+
+    loadings = get_loadings(db, trip_id)
+    for l in loadings:
+        l.loaded_at = ensure_utc(l.loaded_at)
+        l.unloaded_at = ensure_utc(l.unloaded_at)
+
+    cargo_ids = sorted({l.cargo_id for l in loadings})
+    cargos = {
+        c.cargo_id: c
+        for c in db.scalars(
+            select(Cargo).where(Cargo.cargo_id.in_(cargo_ids or [""]))
+        ).all()
+    }
+
+    cargo_windows: dict[str, list[tuple]] = {}
+    for cargo_id in cargo_ids:
+        cargo = cargos.get(cargo_id)
+        if cargo is None:
+            # 外键约束下不应发生；防御性跳过，避免单票脏数据导致整查询失败
+            continue
+        # 与货物报告同一套重建：必须含该货物**全部车次**的上下文——货物可能
+        # 从上一车次带着未闭合越温区间装到本车次，此时自本车次装车时刻起即越温。
+        events, all_loadings, ctx_readings = timeline.load_cargo_context(
+            db, cargo_id
+        )
+        points = timeline.adopted_timeline(events, ctx_readings, all_loadings)
+        result = chain.rebuild_chain(
+            cargo.initial_holder, Decimal(cargo.temp_upper_limit), points
+        )
+        own_loadings = [l for l in all_loadings if l.trip_id == trip_id]
+        windows = overlap.cargo_excursion_windows(
+            result.excursions, own_loadings, start_at, end_at
+        )
+        if windows:
+            cargo_windows[cargo_id] = windows
+
+    return overlap.simultaneous_segments(cargo_windows, min_cargo=min_cargo)
